@@ -1,0 +1,74 @@
+import requests
+import json
+import boto3
+from io import BytesIO
+
+# Adobe API credentials
+CLIENT_ID = 'your_client_id'
+CLIENT_SECRET = 'your_client_secret'
+ACCESS_TOKEN = 'your_access_token'  # Obtain this using OAuth2
+
+# S3 credentials
+S3_BUCKET = 'your_s3_bucket'
+S3_KEY = 'path/to/your/image.png'
+
+# Firefly-generated image URL
+FIREFLY_IMAGE_URL = 'https://your-presigned-url-from-firefly.com/image.png'
+
+# Photoshop API endpoint
+PHOTOSHOP_API_URL = 'https://image.adobe.io/pie/psdService/documentOperations'
+
+# Text to add
+TEXT_CONTENT = "Hello, Adobe Firefly!"
+TEXT_FONT = "Arial"
+TEXT_SIZE = 48
+TEXT_COLOR = {"r": 255, "g": 255, "b": 255}  # White color
+
+# Download the Firefly-generated image
+response = requests.get(FIREFLY_IMAGE_URL)
+image_data = response.content
+
+# Prepare the Photoshop API request payload
+payload = {
+    "inputs": {
+        "href": FIREFLY_IMAGE_URL,
+        "storage": "external"
+    },
+    "options": {
+        "layers": [
+            {
+                "add": {
+                    "text": {
+                        "content": TEXT_CONTENT,
+                        "font": {"name": TEXT_FONT},
+                        "size": TEXT_SIZE,
+                        "color": TEXT_COLOR,
+                        "transform": {"x": 100, "y": 100}  # Position of the text
+                    }
+                }
+            }
+        ]
+    },
+    "output": {
+        "href": "s3://your_s3_bucket/path/to/output_image.png",
+        "storage": "s3",
+        "type": "image/png"
+    }
+}
+
+# Headers for the Photoshop API request
+headers = {
+    "Authorization": f"Bearer {ACCESS_TOKEN}",
+    "Content-Type": "application/json",
+    "x-api-key": CLIENT_ID
+}
+
+# Make the API request to add text
+response = requests.post(PHOTOSHOP_API_URL, headers=headers, data=json.dumps(payload))
+
+if response.status_code == 200:
+    print("Text added successfully!")
+    output_image_url = response.json().get("output", {}).get("href")
+    print(f"Output image URL: {output_image_url}")
+else:
+    print(f"Error: {response.status_code}, {response.text}")
