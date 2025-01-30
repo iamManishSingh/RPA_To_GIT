@@ -1,0 +1,152 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi.responses import PlainTextResponse
+from fastapi.security import APIKeyHeader
+import pandas as pd
+import duckdb
+from openai import OpenAI
+import os
+import re
+import json
+import uuid
+from io import BytesIO
+from dotenv import load_dotenv
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.llms import OpenAI as LangchainOpenAI
+
+load_dotenv()
+
+app = FastAPI()
+api_key_header = APIKeyHeader(name="X-Session-ID")
+
+# Session storage
+sessions = {}
+dataframes = {}
+
+# Initialize OpenAI clients
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+langchain_llm = LangchainOpenAI(temperature=0)
+
+class SessionData:
+    def __init__(self):
+        self.memory = ConversationBufferMemory()
+        self.current_df = None
+        self.llm_chain = LLMChain(
+            llm=langchain_llm,
+            prompt=PromptTemplate.from_template(
+                """Convert the user's request into dataframe transformation actions. Available actions:
+                - rename_column(old_name, new_name)
+                - drop_column(column)
+                - filter_rows(condition)
+                - format_column(column, format_string)
+                
+                Current columns: {columns}
+                Previous transformations: {history}
+                
+                User request: {request}
+                Respond ONLY with valid JSON array:"""
+            ),
+            memory=self.memory,
+        )
+
+def get_session(session_id: str = Depends(api_key_header)) -> SessionData:
+    if session_id not in sessions:
+        sessions[session_id] = SessionData()
+    return sessions[session_id]
+
+def get_schema():
+    return "\n".join([f"Table {name} ({', '.join(df.columns)})" for name, df in dataframes.items()])
+
+@app.post("/upload/")
+async def upload_files(files: list[UploadFile] = File(...), session: SessionData = Depends(get_session)):
+    try:
+        for file in files:
+            content = await file.read()
+            if file.filename.endswith('.csv'):
+                df = pd.read_csv(BytesIO(content))
+                dataframes[file.filename[:-4]] = df
+            elif file.filename.endswith(('.xls', '.xlsx')):
+                xls = pd.ExcelFile(BytesIO(content))
+                for sheet_name in xls.sheet_names:
+                    df = xls.parse(sheet_name)
+                    dataframes[f"{file.filename}_{sheet_name}"] = df
+        return {"message": f"Processed {len(files)} files", "session_id": api_key_header}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/query/")
+async def process_query(prompt: str, session: SessionData = Depends(get_session)):
+    if not dataframes:
+        raise HTTPException(400, "Upload files first")
+    
+    try:
+        # Generate SQL
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{
+                "role": "system",
+                "content": f"Convert to SQL using tables:\n{get_schema()}\nReturn only SQL code"
+            }, {
+                "role": "user",
+                "content": prompt
+            }]
+        )
+        
+        sql = re.search(r"```sql\n(.*?)\n```", response.choices[0].message.content, re.DOTALL).group(1)
+        
+        # Execute query
+        conn = duckdb.connect()
+        for name, df in dataframes.items():
+            conn.register(name, df)
+        session.current_df = conn.execute(sql).fetchdf()
+        
+        return PlainTextResponse(session.current_df.to_markdown(index=False))
+    
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/edit/")
+async def edit_table(request: str, session: SessionData = Depends(get_session)):
+    if session.current_df is None:
+        raise HTTPException(400, "Run a query first")
+    
+    try:
+        # Generate transformation JSON
+        columns = list(session.current_df.columns)
+        response = session.llm_chain.run(
+            columns=columns,
+            history=session.memory.buffer,
+            request=request
+        )
+        
+        # Apply transformations
+        actions = json.loads(response)
+        for action in actions:
+            if action["action"] == "rename_column":
+                session.current_df = session.current_df.rename(
+                    columns={action["old_name"]: action["new_name"]}
+                )
+            elif action["action"] == "drop_column":
+                session.current_df = session.current_df.drop(columns=[action["column"]])
+            elif action["action"] == "filter_rows":
+                session.current_df = session.current_df.query(action["condition"])
+            elif action["action"] == "format_column":
+                session.current_df[action["column"]] = session.current_df[action["column"]].map(
+                    lambda x: action["format_string"].format(x=x)
+                )
+        
+        return PlainTextResponse(session.current_df.to_markdown(index=False))
+    
+    except Exception as e:
+        raise HTTPException(400, f"Edit failed: {str(e)}")
+
+@app.post("/reset/")
+async def reset_session(session: SessionData = Depends(get_session)):
+    session.current_df = None
+    session.memory.clear()
+    return {"message": "Session reset"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
