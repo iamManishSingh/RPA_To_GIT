@@ -1,0 +1,230 @@
+import os
+import io
+import cv2
+import numpy as np
+import requests
+import boto3
+from botocore.exceptions import ClientError
+
+class S3OpenCVEditor:
+    def __init__(self, aws_access_key=None, aws_secret_key=None, region='us-east-1'):
+        self.s3 = boto3.client(
+            's3',
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=region
+        )
+
+    def add_text_to_image(
+        self,
+        presigned_url: str,
+        text: str,
+        font_face: int = cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale: float = 1.0,
+        text_color: tuple = (255, 255, 255),  # BGR format
+        thickness: int = 2,
+        line_type: int = cv2.LINE_AA,
+        position: tuple = ('center', 'center'),
+        margin: int = 20,
+        background_color: tuple = None,
+        background_opacity: float = 0.0,
+        output_format: str = 'jpg',
+        output_quality: int = 95,
+        new_object_key: str = None
+    ) -> str:
+        """
+        Add text to images using OpenCV with advanced features
+        
+        :param presigned_url: Temporary URL to download the image
+        :param text: Text to add (supports multiline with '\n')
+        :param font_face: OpenCV font face constant
+        :param font_scale: Font size scale factor
+        :param text_color: Text color in BGR format
+        :param thickness: Text thickness
+        :param line_type: Line type (cv2.LINE_AA for anti-aliased)
+        :param position: Tuple (x_pos, y_pos) or ('left', 'top'), etc.
+        :param margin: Minimum margin from edges in pixels
+        :param background_color: Background color for text (BGR)
+        :param background_opacity: Background opacity (0.0-1.0)
+        :param output_format: Output format (jpg/png)
+        :param output_quality: Quality for JPEG (0-100)
+        :param new_object_key: S3 key for modified image
+        :return: Presigned URL of modified image
+        """
+        # Download image
+        response = requests.get(presigned_url)
+        if response.status_code != 200:
+            raise ValueError("Failed to download image from presigned URL")
+
+        # Read image with OpenCV
+        image_array = np.asarray(bytearray(response.content), dtype=np.uint8)
+        img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+        # Convert to RGBA for transparency handling
+        if background_color is not None or background_opacity > 0.0:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+
+        # Calculate text dimensions and position
+        (text_width, text_height), baseline = self._get_text_size(
+            text, font_face, font_scale, thickness
+        )
+        x, y = self._calculate_position(
+            position, text_width, text_height, 
+            img.shape[1], img.shape[0], margin
+        )
+
+        # Add text background if specified
+        if background_color is not None:
+            img = self._add_text_background(
+                img, x, y, text_width, text_height, 
+                background_color, background_opacity,
+                baseline, thickness
+            )
+
+        # Add text with OpenCV
+        y += text_height  # Adjust for baseline
+        self._put_text(
+            img, text, (x, y), font_face, font_scale,
+            text_color, thickness, line_type
+        )
+
+        # Encode image
+        encode_params = self._get_encoding_params(output_format, output_quality)
+        success, encoded_img = cv2.imencode(f'.{output_format}', img, encode_params)
+        if not success:
+            raise ValueError("Failed to encode image")
+
+        # Upload to S3
+        bucket, original_key = self._parse_presigned_url(presigned_url)
+        object_key = new_object_key or original_key
+        
+        self.s3.upload_fileobj(
+            io.BytesIO(encoded_img),
+            bucket,
+            object_key,
+            ExtraArgs={
+                'ContentType': f'image/{output_format}',
+                'ACL': 'bucket-owner-full-control'
+            }
+        )
+
+        return self.generate_presigned_url(bucket, object_key)
+
+    def _get_text_size(self, text, font_face, font_scale, thickness):
+        """Calculate text size with proper multiline support"""
+        max_width = 0
+        total_height = 0
+        for line in text.split('\n'):
+            (width, height), baseline = cv2.getTextSize(
+                line, font_face, font_scale, thickness
+            )
+            max_width = max(max_width, width)
+            total_height += height + baseline + thickness
+        return (max_width, total_height), baseline
+
+    def _calculate_position(self, position, text_w, text_h, img_w, img_h, margin):
+        """Calculate text coordinates based on position string"""
+        x_pos, y_pos = position
+        
+        # Horizontal position
+        if x_pos == 'left':
+            x = margin
+        elif x_pos == 'right':
+            x = img_w - text_w - margin
+        else:  # center
+            x = (img_w - text_w) // 2
+
+        # Vertical position
+        if y_pos == 'top':
+            y = margin
+        elif y_pos == 'bottom':
+            y = img_h - text_h - margin
+        else:  # center
+            y = (img_h - text_h) // 2
+
+        return x, y
+
+    def _add_text_background(self, img, x, y, w, h, color, opacity, baseline, thickness):
+        """Add background rectangle with opacity"""
+        alpha = img[:, :, 3] if img.shape[2] == 4 else None
+        
+        # Create overlay
+        overlay = img.copy()
+        cv2.rectangle(
+            overlay,
+            (x - thickness, y - thickness - baseline),
+            (x + w + thickness, y + h + thickness),
+            color,
+            -1
+        )
+        
+        # Blend with original image
+        cv2.addWeighted(overlay, opacity, img, 1 - opacity, 0, img)
+        
+        if alpha is not None:
+            img[:, :, 3] = alpha  # Restore alpha channel
+        return img
+
+    def _put_text(self, img, text, org, font_face, font_scale, color, thickness, line_type):
+        """Multiline text support for OpenCV"""
+        y = org[1]
+        for line in text.split('\n'):
+            (w, h), baseline = cv2.getTextSize(
+                line, font_face, font_scale, thickness
+            )
+            cv2.putText(
+                img, line, (org[0], y), font_face, font_scale,
+                color, thickness, line_type
+            )
+            y += h + baseline + thickness
+
+    def _get_encoding_params(self, format, quality):
+        """Get OpenCV encoding parameters"""
+        if format.lower() == 'jpg':
+            return [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        elif format.lower() == 'png':
+            return [int(cv2.IMWRITE_PNG_COMPRESSION), 9 - round(quality/10)]
+        return []
+
+    # Remaining methods (_parse_presigned_url, generate_presigned_url) same as previous example
+
+# Example Usage
+if __name__ == "__main__":
+    editor = S3OpenCVEditor(
+        aws_access_key='YOUR_ACCESS_KEY',
+        aws_secret_key='YOUR_SECRET_KEY',
+        region='your-region'
+    )
+
+    presigned_url = "https://your-bucket.s3.amazonaws.com/path/to/image.jpg?X-Amz-..."
+
+    try:
+        new_url = editor.add_text_to_image(
+            presigned_url=presigned_url,
+            text="OpenCV\nWatermark",
+            font_face=cv2.FONT_HERSHEY_DUPLEX,
+            font_scale=2.0,
+            text_color=(0, 0, 255),  # Red in BGR
+            thickness=3,
+            line_type=cv2.LINE_AA,
+            position=('right', 'bottom'),
+            margin=30,
+            background_color=(255, 255, 255),  # White background
+            background_opacity=0.3,
+            output_format='png',
+            output_quality=90,
+            new_object_key="modified/opencv_watermarked.png"
+        )
+
+        print(f"Modified image URL: {new_url}")
+
+    except Exception as e:
+        print(f"Error processing image: {e}")
+
+
+
+import cv2
+ft = cv2.freetype.createFreeType2()
+ft.loadFontData(fontFileName='arial.ttf', id=0)
+
+# Then use ft.putText() instead of cv2.putText()
