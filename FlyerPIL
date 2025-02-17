@@ -1,0 +1,186 @@
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+import requests
+from io import BytesIO
+from pydantic import BaseModel, HttpUrl
+from typing import List, Optional, Tuple
+import textwrap
+
+# ------------ Data Models ------------
+class TextStyle(BaseModel):
+    font: str = "Arial"
+    size: int = 40
+    color: str = "#000000"
+    position: Tuple[int, int] = (100, 100)
+    max_width: Optional[int] = None
+    alignment: str = "left"
+
+class TextContent(BaseModel):
+    heading: str
+    subtext: Optional[str]
+    heading_style: TextStyle
+    subtext_style: TextStyle
+
+class ImageStyle(BaseModel):
+    size: Tuple[int, int] = (400, 300)
+    shape: str = "rectangle"
+    position: Tuple[int, int] = (100, 100)
+    border_radius: int = 20  # For rounded rectangles
+
+class ImageContent(BaseModel):
+    url: HttpUrl
+    style: ImageStyle
+
+class FlyerConfig(BaseModel):
+    dimensions: Tuple[int, int] = (1200, 1600)
+    background_color: str = "#FFFFFF"
+    texts: List[TextContent]
+    images: List[ImageContent]
+
+# ------------ Core Implementation ------------
+class FlyerGenerator:
+    def __init__(self, config: FlyerConfig):
+        self.config = config
+        self.canvas = Image.new(
+            "RGB", 
+            self.config.dimensions, 
+            self.config.background_color
+        )
+        
+    def _load_image(self, image_url: str) -> Image.Image:
+        """Fetch and load image from URL"""
+        try:
+            response = requests.get(image_url)
+            return Image.open(BytesIO(response.content)).convert("RGBA")
+        except Exception as e:
+            print(f"Error loading image: {e}")
+            return None
+
+    def _apply_image_mask(self, image: Image.Image, shape: str, radius: int) -> Image.Image:
+        """Apply shape mask to image"""
+        mask = Image.new("L", image.size, 0)
+        draw = ImageDraw.Draw(mask)
+        
+        if shape == "circle":
+            draw.ellipse((0, 0, *image.size), fill=255)
+        elif shape == "rounded_rectangle":
+            draw.rounded_rectangle([0, 0, *image.size], radius=radius, fill=255)
+        else:  # rectangle
+            draw.rectangle([0, 0, *image.size], fill=255)
+            
+        image.putalpha(mask)
+        return image
+
+    def _process_image(self, image_content: ImageContent) -> Image.Image:
+        """Process and position image on canvas"""
+        img = self._load_image(image_content.url)
+        if not img:
+            return
+            
+        # Resize image
+        img.thumbnail(image_content.style.size, Image.Resampling.LANCZOS)
+        
+        # Apply shape mask
+        img = self._apply_image_mask(
+            img,
+            image_content.style.shape,
+            image_content.style.border_radius
+        )
+        
+        # Position image
+        self.canvas.paste(
+            img, 
+            image_content.style.position,
+            img  # Use alpha channel as mask
+        )
+
+    def _draw_text(self, text: str, style: TextStyle):
+        """Render text on canvas with wrapping and alignment"""
+        draw = ImageDraw.Draw(self.canvas)
+        
+        try:
+            font = ImageFont.truetype(style.font, style.size)
+        except IOError:
+            font = ImageFont.load_default(style.size)
+            
+        position = list(style.position)
+        max_width = style.max_width or self.config.dimensions[0] - position[0]
+        
+        # Text wrapping
+        wrapped_text = textwrap.wrap(text, width=max_width // (style.size // 2))
+        
+        for line in wrapped_text:
+            bbox = draw.textbbox(position, line, font=font)
+            text_width = bbox[2] - bbox[0]
+            
+            # Handle alignment
+            if style.alignment == "center":
+                position[0] = (self.config.dimensions[0] - text_width) // 2
+            elif style.alignment == "right":
+                position[0] = self.config.dimensions[0] - text_width - position[0]
+                
+            draw.text(
+                tuple(position),
+                line,
+                font=font,
+                fill=style.color
+            )
+            position[1] += style.size + 5  # Line spacing
+
+    def generate(self, output_path: str = "flyer.png"):
+        """Generate and save final flyer"""
+        # Process images first
+        for image_content in self.config.images:
+            self._process_image(image_content)
+            
+        # Add text layers
+        for text_content in self.config.texts:
+            self._draw_text(text_content.heading, text_content.heading_style)
+            if text_content.subtext:
+                self._draw_text(text_content.subtext, text_content.subtext_style)
+                
+        # Save output
+        self.canvas.save(output_path, quality=95)
+        print(f"Flyer generated: {output_path}")
+
+# ------------ Usage Example ------------
+if __name__ == "__main__":
+    # Example configuration
+    config = FlyerConfig(
+        dimensions=(1200, 1600),
+        background_color="#F0F8FF",
+        texts=[
+            TextContent(
+                heading="Summer Sale!",
+                subtext="Up to 70% Off Selected Items\nLimited Time Offer",
+                heading_style=TextStyle(
+                    font="arialbd.ttf",
+                    size=72,
+                    color="#FF4500",
+                    position=(100, 200),
+                    max_width=1000,
+                    alignment="center"
+                ),
+                subtext_style=TextStyle(
+                    font="arial.ttf",
+                    size=48,
+                    color="#2A2A2A",
+                    position=(100, 350),
+                    alignment="center"
+                )
+            )
+        ],
+        images=[
+            ImageContent(
+                url="https://example.com/fashion.jpg",
+                style=ImageStyle(
+                    size=(600, 600),
+                    shape="circle",
+                    position=(300, 500)
+                )
+            )
+        ]
+    )
+    
+    # Generate flyer
+    generator = FlyerGenerator(config)
+    generator.generate("summer_sale_flyer.png")
