@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flyer Approval System</title>
+    <style>
+        .approval-card {
+            border: 1px solid #ccc;
+            padding: 20px;
+            margin: 10px;
+            border-radius: 8px;
+            max-width: 600px;
+        }
+        .content-display {
+            background: #f5f5f5;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        button {
+            padding: 8px 20px;
+            margin: 5px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .approve-btn { background: #4CAF50; color: white; }
+        .reject-btn { background: #f44336; color: white; }
+    </style>
+</head>
+<body>
+    <h1>Approval Dashboard</h1>
+    <div id="approvals"></div>
+
+    <script>
+        const ws = new WebSocket('ws://localhost:8080/ws');
+        const approvalsContainer = document.getElementById('approvals');
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.type === 'approval_request') {
+                const card = document.createElement('div');
+                card.className = 'approval-card';
+                card.id = data.approval_id;
+                
+                card.innerHTML = `
+                    <h3>${data.content_type.toUpperCase()} Approval Request</h3>
+                    <div class="content-display">
+                        ${formatContent(data.content)}
+                    </div>
+                    <button class="approve-btn" onclick="handleResponse('${data.approval_id}', true)">Approve</button>
+                    <button class="reject-btn" onclick="handleResponse('${data.approval_id}', false)">Reject</button>
+                `;
+                
+                approvalsContainer.appendChild(card);
+            }
+        };
+
+        function formatContent(content) {
+            if (typeof content === 'object') {
+                return Object.entries(content).map(([key, value]) => `
+                    <p><strong>${key}:</strong> ${Array.isArray(value) ? value.join(', ') : value}</p>
+                `).join('');
+            }
+            return content;
+        }
+
+        function handleResponse(approvalId, approved) {
+            ws.send(JSON.stringify({
+                type: 'approval_response',
+                approval_id: approvalId,
+                approved: approved
+            }));
+            document.getElementById(approvalId).remove();
+        }
+    </script>
+</body>
+</html>
